@@ -1,94 +1,250 @@
-# CareerPilot AI — Multi-Agent Career & Job Intelligence System
+<div align="center">
 
-Real LangGraph multi-agent app: live DuckDuckGo web search (no API key) → resume parsing → explainable matching → SSRF-safe job verification → career advice → ranked report. FastAPI backend, Streamlit UI, SQLAlchemy persistence (SQLite by default, PostgreSQL supported).
+# 🧭 CareerPilot AI
 
-**Status:** 42 pytest tests pass with mocked external APIs. Live DuckDuckGo/Groq calls were **not** exercised in the build environment (no internet/keys) — run the live checks below with your own keys. No accuracy metrics are claimed; `scripts/evaluate.py` measures them on your data.
+**Multi-Agent Career & Job Intelligence System**
 
-## Setup (Windows PowerShell)
-```powershell
-cd careerpilot-ai
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-Copy-Item .env.example .env     # then edit .env and add GROQ_API_KEY (optional)
-pytest -q                       # unit tests (no keys needed)
+Live job search · explainable resume matching · evidence-based job verification · automatic skill roadmap
 
-# Terminal 1 (API)
-uvicorn app.main:app --port 8000 --reload
-# Terminal 2 (UI)
-streamlit run frontend/streamlit_app.py
-```
-API docs: http://localhost:8000/docs · UI: http://localhost:8501
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![LangGraph](https://img.shields.io/badge/LangGraph-multi--agent-purple) ![FastAPI](https://img.shields.io/badge/FastAPI-backend-009688) ![Streamlit](https://img.shields.io/badge/Streamlit-UI-ff4b4b) ![Tests](https://img.shields.io/badge/tests-42%20passing-brightgreen)
 
-**Search / keys / limits:** Search uses DuckDuckGo through the open-source `ddgs` package: free, no account or key. It is unofficial scraping, so it can be rate-limited or return empty results; the app retries a bounded number of times, then reports the failure (never fake data). Queries run 2 at a time to stay gentle. `ddgs` is community-maintained and its behaviour can change; if it breaks, upgrade it (`pip install -U ddgs`) or set `SEARCH_PROVIDER=tavily` with a `TAVILY_API_KEY` (paid-tier-limited, see tavily.com pricing). Groq (console.groq.com) is optional: without `GROQ_API_KEY`, request parsing and advice use clearly-labelled rule-based fallbacks. Change `GROQ_MODEL` if the default is retired; check that your model supports tool calling.
+</div>
 
-**Smoke test with live keys:** `curl http://localhost:8000/health` should show `search_ready: true`; then run a search in the UI and confirm real source URLs appear.
+## Overview
+
+CareerPilot AI is a **multi-agent system built on LangGraph** that finds real job listings on the live web, scores each one against your resume, checks whether the job is actually open, and generates a personalised learning roadmap for the skills you are missing.
+
+It is designed around one rule: **the LLM never writes job data.** Listings come only from search results, unknown fields stay empty, scores come from a documented formula, and a job is marked *Verified open* only when page evidence supports it.
+
+### Features
+
+- 🔍 **Natural-language job search**: "fresher GenAI engineer in Hyderabad" becomes structured criteria (Groq tool calling, with a rule-based fallback).
+- 📄 **Resume Analyzer**: upload a PDF/TXT or paste text, paste a job description, and get a match score, skill gaps, best-fit roles and recommendations.
+- ✅ **Job verification with evidence**: *Verified open*, *Likely open*, *Uncertain*, *Expired/Closed* or *Inaccessible*, with the reasons shown.
+- 🗺️ **Automatic career roadmap**: weekly plan, projects and interview questions generated from your resume-vs-JD gaps.
+- 🗂️ **Application tracker**: save jobs, mark them applied, and track Interview / Offer / Rejected with notes (persisted in the database).
+- 🤖 **Live agent activity**: every event in the UI is written by a graph node as it actually runs.
 
 ## Architecture
+
 ```mermaid
 flowchart LR
-  UI[Streamlit] -->|REST| API[FastAPI]
+  UI[Streamlit UI] -->|REST| API[FastAPI]
   API -->|background task| G[LangGraph workflow]
-  G --> DB[(SQLite/PostgreSQL)]
-  G --> T[DuckDuckGo] & L[Groq] & W[Job pages]
+  G --> DB[(SQLite / PostgreSQL)]
+  G --> S[Web search: DuckDuckGo or Tavily]
+  G --> L[Groq LLM]
+  G --> W[Job pages - safe fetch]
 ```
+
+### Agent workflow
+
 ```mermaid
 flowchart TD
-  plan[Supervisor: parse request] --> resume[Resume agent: profile] --> search[Job Search agent] --> match[Matching agent] --> verify[Verification agent] --> review{Supervisor review}
-  review -- too few good jobs and iterations left --> search
-  review -- else --> advise[Career Advisor] --> report[Report agent] --> END
+  plan[Supervisor: parse request] --> resume[Resume agent: build profile]
+  resume --> search[Job Search agent]
+  search --> match[Matching agent]
+  match --> verify[Verification agent]
+  verify --> review{Supervisor review}
+  review -- too few good jobs and rounds left --> search
+  review -- otherwise --> advise[Career Advisor agent]
+  advise --> report[Report agent]
+  report --> END((Done))
 ```
-| Agent | File | Real tools |
+
+| # | Agent | Responsibility | Tools / method |
+|---|---|---|---|
+| 1 | **Supervisor** | Parses the request, reviews result quality, routes (re-search or continue), capped retries | Groq tool calling; rule-based fallback |
+| 2 | **Job Search** | Concurrent live searches, filters non-job pages, de-duplicates | DuckDuckGo (`ddgs`) or Tavily |
+| 3 | **Resume** | PDF/text to structured profile; never infers missing facts | PyMuPDF + skill vocabulary |
+| 4 | **Matching** | Transparent weighted score and skill gaps | Rules + cosine similarity |
+| 5 | **Verification** | Safe page fetch, evidence-based status, re-scoring from real page text | httpx, SSRF guard |
+| 6 | **Career Advisor** | Skills to learn, weekly plan, projects, interview questions (labelled AI-generated) | Groq JSON mode; rule-based fallback |
+| 7 | **Report** | Ranks results (verified first), CSV export | Pure Python |
+
+### Match score
+
+`score = 100 × Σ wᵢ·cᵢ / Σ wᵢ` over the components that have data (missing components are dropped and the weights re-balanced).
+
+| Component | Default weight |
+|---|---|
+| Skills (required = 1.0, preferred = 0.5) | 0.40 |
+| Semantic similarity | 0.20 |
+| Role / title relevance | 0.15 |
+| Experience fit | 0.10 |
+| Location fit | 0.10 |
+| Education fit | 0.05 |
+
+Weights are configurable through `MATCH_WEIGHTS`. This is an interpretable heuristic, **not** a probability of getting hired.
+
+### Verification statuses
+
+| Status | Meaning |
+|---|---|
+| 🟢 Verified open | HTTP 200 + official/ATS source + apply option + job title on page + no closed wording |
+| 🟡 Likely open | Apply evidence found but not fully confirmed (e.g. a job board) |
+| 🟠 Uncertain | Page reachable but no clear evidence, or it is a general jobs index rather than one posting |
+| 🔴 Expired / Closed | 404/410, closed wording, or a past `validThrough` date |
+| ⚫ Inaccessible | Blocked or unreachable. **Not** treated as closed |
+
+Web pages are only pattern-matched and never sent to an LLM, which protects against prompt injection.
+
+## Tech stack
+
+| Layer | Technology | Why |
 |---|---|---|
-| Supervisor | `agents/supervisor.py` | Groq tool-calling (forced function call), bounded routing (`MAX_ITERATIONS`) |
-| Job Search | `agents/job_search_agent.py` | DuckDuckGo (`ddgs`) or Tavily, concurrent queries, URL dedupe |
-| Resume | `agents/resume_agent.py` | PyMuPDF; nothing inferred (years of experience only if stated) |
-| Matching | `agents/matching_agent.py` | Skill vocabulary + cosine similarity (Sentence Transformers if enabled) |
-| Verification | `agents/verification_agent.py`, `tools/webpage_verifier.py` | httpx, SSRF guard, manual redirect checks |
-| Advisor | `agents/career_advisor_agent.py` | Groq JSON mode; labelled AI-generated |
-| Report | `agents/report_agent.py` | Ranking, CSV (formula-injection safe), Markdown |
+| Orchestration | **LangGraph** | Typed state, conditional edges, bounded retry loop |
+| LLM | **Groq** (Llama 3.3 70B) | Fast, free tier, tool calling |
+| Search | **DuckDuckGo (`ddgs`)** default, **Tavily** optional | Free, no key / structured AI-search API |
+| Backend | **FastAPI** + Pydantic | Async, validated schemas, auto docs |
+| Frontend | **Streamlit** | Fast Python UI with live progress polling |
+| Resume parsing | **PyMuPDF** | Reliable PDF text extraction |
+| Similarity | **Sentence Transformers** (optional) / lexical cosine fallback | Semantic matching |
+| Database | **SQLAlchemy** + SQLite / PostgreSQL | Persistence for jobs, matches, verifications, applications, events |
+| HTTP | **httpx** | Async, timeouts, manual redirect control |
+| Testing | **pytest** | 42 tests with mocked external services |
 
-Events shown in the UI are written by workflow nodes as they actually run (table `agent_events`); there are no scripted delays. Progress uses polling of `GET /api/search/{id}`.
+## Getting started
 
-## Match score
-`score = 100 · Σ wᵢ·cᵢ / Σ wᵢ` over components that have data (missing components are dropped and weights renormalised). Defaults: skills 0.40, semantic 0.20, role 0.15, experience 0.10, education 0.05, location 0.10; override via `MATCH_WEIGHTS` JSON. Skills component = (required matched + 0.5·preferred matched) / (required + 0.5·preferred). Semantic similarity uses `sentence-transformers/all-MiniLM-L6-v2` when `USE_SENTENCE_TRANSFORMERS=1` and the package is installed, otherwise a lexical cosine (the backend is recorded in each result). It is an interpretable heuristic, **not** a hiring probability.
+### 1. Clone and install
 
-## Verification statuses
-`verified_open` requires: HTTP 200 + official/ATS source + apply evidence (or JobPosting data with future `validThrough`) + job title on page + no closed-language. Aggregators with apply evidence are at most `likely_open`. Reachable but no evidence → `uncertain`. 404/410/closed text/past `validThrough` → `expired_or_closed`. 403/429/timeouts/blocked → `inaccessible` (explicitly *not* treated as closed). Pages are only pattern-matched, never fed to an LLM (prompt-injection safe).
+**Windows (Command Prompt):**
+```bat
+git clone https://github.com/<your-username>/careerpilot-ai.git
+cd careerpilot-ai
+python -m venv .venv
+.venv\Scripts\activate.bat
+pip install -r requirements.txt
+copy .env.example .env
+```
+
+**macOS / Linux / PowerShell:**
+```bash
+python -m venv .venv && source .venv/bin/activate    # PowerShell: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+cp .env.example .env                                  # PowerShell: Copy-Item .env.example .env
+```
+
+### 2. Configure `.env`
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | – | Optional. Without it, parsing and advice use rule-based fallbacks |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Must support tool calling |
+| `SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo` (no key) or `tavily` |
+| `TAVILY_API_KEY` | – | Required only when `SEARCH_PROVIDER=tavily` |
+| `DATABASE_URL` | `sqlite:///./careerpilot.db` | PostgreSQL: `postgresql+psycopg2://user:pass@host:5432/db` |
+| `MAX_ITERATIONS` | `2` | Max search rounds |
+| `MIN_GOOD_JOBS` | `3` | Verified/likely-open jobs needed before stopping |
+| `VERIFY_TOP_N` | `10` | Listings verified per round |
+| `MAX_PDF_MB` / `RATE_LIMIT_PER_MIN` | `5` / `30` | Upload and rate limits |
+| `USE_SENTENCE_TRANSFORMERS` | `0` | `1` enables embeddings (`pip install sentence-transformers`) |
+| `MATCH_WEIGHTS` | built-in | JSON override of the scoring weights |
+
+Never commit `.env`; it is already in `.gitignore`.
+
+### 3. Run
+
+```bat
+:: Terminal 1: API
+uvicorn app.main:app --port 8000
+
+:: Terminal 2: UI (run from the project root)
+streamlit run frontend\streamlit_app.py
+```
+
+- UI: http://localhost:8501
+- API docs: http://localhost:8000/docs
+- Health check: http://localhost:8000/health
+
+### 4. Test
+
+```bash
+pytest -q
+```
+
+## Using the app
+
+1. **Resume Analyzer**: upload a resume, paste a job description, click *Analyze Resume*. This gives the match score, gaps, role fit and a roadmap, and saves your profile for searches.
+2. **Job Search**: describe what you want, search, and watch the agents work live.
+3. **Job Results**: sort and filter, open *View details* for the match breakdown and verification evidence, then *Save* or *Mark as applied*.
+4. **Career Roadmap**: generated automatically from your analysis or search results.
+5. **Applications**: applications happen on external sites, so this is your personal log. Mark jobs as applied, then update the status and notes as things progress.
 
 ## API
-`GET /health` · `POST /api/search` (202) · `GET /api/search/{id}` · `POST /api/resume/analyze` · `POST /api/resume/compare` (resume file/text + job description) · `POST /api/jobs/match` · `POST /api/jobs/verify` · `GET /api/jobs` · `POST /api/jobs/save` · `GET /api/jobs/saved` · `DELETE /api/jobs/saved/{id}` · `GET /api/applications` · `PATCH /api/applications/{id}` · `GET /api/reports/{id}` · `GET /api/reports/{id}/csv` · `GET /api/dashboard`. List endpoints take `limit`/`offset`.
-```powershell
-curl -X POST http://localhost:8000/api/search -H "Content-Type: application/json" -d '{\"query\":\"fresher GenAI engineer in Hyderabad\"}'
+
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Service and search-provider status |
+| POST | `/api/search` | Start a search (returns `search_id`, runs in background) |
+| GET | `/api/search/{id}` | Status and live agent events |
+| POST | `/api/resume/analyze` | Parse a PDF resume into a profile |
+| POST | `/api/resume/compare` | Resume (file or text) + job description: score, gaps, roles, roadmap |
+| POST | `/api/jobs/match` | Score stored jobs against a profile |
+| POST | `/api/jobs/verify` | Verify stored jobs |
+| GET | `/api/jobs` | List jobs with match and verification (paginated) |
+| POST | `/api/jobs/save` | Save a job and/or log a status (e.g. `Applied`) |
+| GET / DELETE | `/api/jobs/saved`, `/api/jobs/saved/{id}` | List / remove saved jobs |
+| GET / PATCH | `/api/applications`, `/api/applications/{id}` | Tracker list and updates |
+| GET | `/api/reports/{id}`, `/api/reports/{id}/csv` | Full report / CSV download |
+| GET | `/api/dashboard` | Dashboard statistics |
+
+```bash
+curl -X POST http://localhost:8000/api/search -H "Content-Type: application/json" \
+  -d '{"query": "fresher GenAI engineer in Hyderabad"}'
 ```
 
-## Security
-Secrets only via env; PDF type/size/magic-byte checks, in-memory parsing, resume text never stored or logged; SSRF guard (http/https, ports 80/443, public IPs only, re-validated on every redirect, max 5 hops, 400 KB body cap); per-IP rate limit; bounded retries; no auto-apply/email features.
+## Project structure
 
-## Testing & evaluation
-`pytest -q` (mocked). `scripts/evaluate.py report.json labels.json` computes duplicate rate, link accessibility and verification precision against your manual labels (`app/services/evaluation.py` also has relevance, score consistency and API-failure helpers). Latency is observable from `agent_events` timestamps.
+```
+careerpilot-ai/
+├── app/
+│   ├── main.py                  # FastAPI app
+│   ├── config.py                # env-based settings
+│   ├── agents/                  # supervisor, job_search, resume, matching,
+│   │                            # verification, career_advisor, report
+│   ├── graph/                   # LangGraph state + workflow
+│   ├── tools/                   # web_search, webpage_verifier, resume_parser, url_safety
+│   ├── services/                # llm, semantic similarity, resume analysis, evaluation
+│   ├── database/                # SQLAlchemy models, connection, repository
+│   ├── api/routes/              # REST endpoints
+│   └── models/schemas.py        # Pydantic schemas
+├── frontend/streamlit_app.py    # UI
+├── .streamlit/config.toml       # light theme
+├── scripts/evaluate.py          # evaluation metrics on your data
+├── tests/                       # pytest suite (mocked external APIs)
+├── requirements.txt
+└── .env.example
+```
+
+## Security and reliability
+
+- **SSRF protection**: only public `http/https` on ports 80/443; credentials in URLs rejected; every redirect hop re-validated (max 5); 400 KB response cap.
+- **Prompt-injection safe**: page text is never sent to an LLM; text sent to the LLM is passed as data.
+- **Resume privacy**: PDFs are parsed in memory; resume text is never stored or logged (only the structured profile is kept).
+- **Hardening**: upload type/size/magic-byte checks, per-IP rate limiting, bounded retries, secrets only in environment variables, CSV formula-injection protection.
+- **Honest failures**: if search or the LLM is unavailable, the app reports it clearly. It never substitutes fabricated data.
+
+## Evaluation
+
+`python scripts/evaluate.py report.json labels.json` computes duplicate rate, link accessibility and verification precision against labels you create by hand. `app/services/evaluation.py` also provides relevance, score-consistency and API-failure helpers. No accuracy numbers are claimed here; measure them on your own data.
+
+## Limitations
+
+- No authentication (single-user). Add auth and a `user_id` per record before multi-user hosting.
+- DuckDuckGo search uses an unofficial library and can be rate-limited or change; switch to Tavily with `SEARCH_PROVIDER=tavily` if needed.
+- JavaScript-rendered or login-walled sites (e.g. LinkedIn) usually end up *Inaccessible*.
+- Job fields come from search snippets plus the fetched page, so company, location and posted date can be empty.
+- DNS rebinding between URL validation and fetch is not fully closed (pin the resolved IP in a custom transport).
+- "Best Matching Roles" is skill-profile overlap, not a trained model.
+- Application tracking is manual because applications happen on external sites.
+- No OCR for scanned PDFs, no PDF report export; progress uses polling, not SSE; background tasks run in-process.
+
+## Roadmap ideas
+
+Authentication and multi-user support · task queue (Celery/RQ) · SSE streaming · Playwright-based verification for JS pages · embeddings by default · email reminders for application follow-ups · PDF report export.
 
 ## Deployment
-API: Render/Railway/Fly — start `uvicorn app.main:app --host 0.0.0.0 --port $PORT`, set env vars, use a managed PostgreSQL `DATABASE_URL` (`postgresql+psycopg2://...`). UI: Streamlit Community Cloud with `frontend/streamlit_app.py` and secret `API_URL=https://<your-api>`; add that UI origin to CORS in `app/main.py`. Run a single API worker (rate limiter is in-memory).
 
-## Limitations / future work
-No authentication (single-user; add auth + `user_id` columns before multi-user hosting). DNS-rebinding between validation and fetch is not fully closed (pin resolved IP in a custom transport). Job fields come from search snippets via heuristics (company/location may be empty). JS-rendered or login-walled pages (LinkedIn etc.) usually end as `inaccessible`. The recency filter maps to DuckDuckGo's day/week/month/year time limit (coarse, based on the engine's own dating). No OCR for scanned PDFs, no PDF report export yet, background tasks are in-process (use a queue for scale), progress is polling not SSE.
-
-## Resume line
-Built CareerPilot AI, a 7-agent LangGraph system (FastAPI, Streamlit, PostgreSQL/SQLite) performing live DuckDuckGo job search, resume-to-job matching with explainable scoring, and SSRF-safe listing verification with evidence-based status.
-
-## LinkedIn draft
-Just built CareerPilot AI: a multi-agent job-intelligence app using LangGraph, Groq tool-calling and DuckDuckGo live search. It never claims a job is open without evidence, explains every match score, and tracks applications. Code + architecture on GitHub. #GenAI #LangGraph #AgenticAI
-
-## Interview Q&A
-- **Why LangGraph?** Explicit typed state, conditional edges (review → re-search) and bounded loops instead of free-form agent recursion.
-- **How do you avoid hallucinated jobs?** Jobs come only from search results; unknown fields stay `None`; LLMs never write job data.
-- **How is prompt injection handled?** Web pages are never given to an LLM; user/web text passed to LLMs is wrapped as data with instructions to ignore commands.
-- **Why isn't "page loads" = "open"?** Needs apply evidence, title match, official/ATS source; blocked pages are `inaccessible`, not closed.
-- **Score validity?** Weighted heuristic with documented formula; not predictive, tune weights/evaluate with labelled data.
-
-## Application tracking
-Applications happen on external sites, so the tracker is a personal log, not an automatic sync: click **Mark as applied** on a job (records today's date), then update status/notes on the Applications page.
-
-## Roadmap
-The Career Roadmap is generated automatically from your Resume Analyzer result (gaps vs. the pasted job description, or vs. your best-fit role when no JD is given) and from job-search results; switch between them on the page. Run Streamlit from the project root so `.streamlit/config.toml` (light theme) is applied.
+- **API:** Render / Railway / Fly.io. Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`. Set env vars and use a managed PostgreSQL `DATABASE_URL`. Run a single worker (the rate limiter is in-memory).
+- **UI:** Streamlit Community Cloud with `frontend/streamlit_app.py` and the secret `API_URL=https://<your-api>`. Add the UI origin to the CORS list in `app/main.py`.
